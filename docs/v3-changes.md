@@ -197,4 +197,6 @@ and the callback addresses and settings to change first are under
   `POST /api/v1/playlists/<id>/request-missing`. The button on the playlist
   page works as before, but v3 has no such route: the page works out the
   missing albums itself and sends them to `POST /api/v3/requests/batches`.
-  A script that called the old route has to do the same.
+  A script that called the old route has to do the same. "Request songs"
+  sends each missing song's recording to `POST /api/v3/requests/tracks/batches`
+  the same way.

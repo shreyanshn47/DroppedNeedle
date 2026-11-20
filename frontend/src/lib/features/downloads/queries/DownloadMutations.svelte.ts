@@ -218,6 +218,30 @@ export function createRequestTrackMutation() {
 	}));
 }
 
+export type TrackBatchItem = components['schemas']['TrackIntake'];
+
+// A playlist's missing songs, each asked for as a single track. The toast
+// renders the server's counts, so skipped songs are never claimed as queued.
+export function createRequestTrackBatchMutation() {
+	return createAppMutation(() => ({
+		effects: () => [...trackRequested(), ...requestSurface()],
+		mutationFn: (items: TrackBatchItem[]) =>
+			api.v3.POST(v3('/api/v3/requests/tracks/batches'), { items }),
+		onSuccess: (data: components['schemas']['BatchIntakeResponse']) => {
+			const counts = batchRequestCopy(data.requested, data.skipped, data.overflow);
+			toastStore.show({
+				message:
+					data.status === 'awaiting_approval'
+						? `Songs submitted for admin approval: ${counts}`
+						: `Songs: ${counts}`,
+				type: data.success ? 'success' : 'error'
+			});
+		},
+		onError: (err: unknown) =>
+			toastStore.show({ message: errorMessage(err, 'Song requests failed'), type: 'error' })
+	}));
+}
+
 export function createCancelDownloadMutation() {
 	return createAppMutation(() => ({
 		effects: tasks,

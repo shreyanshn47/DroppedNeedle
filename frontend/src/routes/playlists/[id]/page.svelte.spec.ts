@@ -61,6 +61,12 @@ vi.mock('$lib/features/playlists/queries/PlaylistV3Mutations.svelte', () => ({
 	forgetPlaylistSources: mockForgetSources
 }));
 
+// The missing-songs banner's request hook; its own spec covers it.
+vi.mock('$lib/features/downloads/queries/DownloadMutations.svelte', async (importOriginal) => ({
+	...(await importOriginal<Record<string, unknown>>()),
+	createRequestTrackBatchMutation: () => ({ mutateAsync: vi.fn(), isPending: false })
+}));
+
 // A real client with no persister.
 vi.mock('$lib/queries/QueryClient', async () => {
 	const { QueryClient } = await import('@tanstack/svelte-query');
