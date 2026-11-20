@@ -126,6 +126,8 @@ impl Rig {
 
 /// The release group the MusicBrainz mock proves _Neon Meridian_ is.
 const NEON_MERIDIAN_GROUP: &str = "5907a1b0-0000-4000-8000-000000000b01";
+/// The recording carrying "Midnight Drive"'s ISRC on that release.
+const NEON_MIDNIGHT_RECORDING: &str = "5907a1b0-0000-4000-8000-000000000e01";
 
 fn rig_for(auth: &AuthRig, api_base: &str, accounts_base: &str, cover_cdn: Option<&str>) -> Rig {
     rig_with(auth, api_base, accounts_base, cover_cdn, None, None)
@@ -991,9 +993,10 @@ async fn spotify_import_populates_tracks_from_items() {
     );
 
     // The `is_local` row never lands. MusicBrainz proves the first album
-    // by its track's ISRC, so it carries its release group. The second
+    // by its track's ISRC, so it carries its release group and the
+    // recording behind that ISRC, which a song request needs. The second
     // album's namesake carries another ISRC: a name alone proves nothing,
-    // so it stays unresolved.
+    // so it stays unresolved and names no recording.
     let rows = playlist_rows(&bundle.playlists, &user_id, &playlist_id).await;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].track_name, "Midnight Drive");
@@ -1004,8 +1007,13 @@ async fn spotify_import_populates_tracks_from_items() {
         Some(format!("/api/v3/covers/release-group/{NEON_MERIDIAN_GROUP}?size=250").as_str())
     );
     assert_eq!(rows[0].duration, Some(183.0));
+    assert_eq!(
+        rows[0].recording_mbid.as_deref(),
+        Some(NEON_MIDNIGHT_RECORDING)
+    );
     assert_eq!(rows[1].track_name, "Glass Tides");
     assert_eq!(rows[1].album_id, None);
+    assert_eq!(rows[1].recording_mbid, None);
     assert_eq!(rows[1].duration, Some(201.0));
 
     // The cover persisted best-effort.
@@ -1464,6 +1472,7 @@ async fn spotify_sqlite_stores_persist_and_expire() {
         disc_number: Some(1),
         duration: Some(183),
         cover_url: None,
+        recording_mbid: None,
     };
     db.write("test.owned_album", |tx| {
         tx.execute_batch(&format!(

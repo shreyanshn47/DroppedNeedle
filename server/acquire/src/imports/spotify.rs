@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::error::ImportsError;
 use super::models::{SpotifyAuthUrlResponse, SpotifyPlaylistItem, SpotifyPlaylistListResponse};
-use super::spotify_albums::{AlbumResolver, SpotifyAlbum};
+use super::spotify_albums::{AlbumResolver, ProvenAlbum, SpotifyAlbum};
 use super::spotify_client::{
     SpotifyClient, SpotifyError, TokenRefresher, best_image_url, playlist_track_count,
 };
@@ -41,6 +41,9 @@ pub struct ImportedTrack {
     pub duration: Option<i64>,
     /// MB cover URL when resolved, else the Spotify image pick.
     pub cover_url: Option<String>,
+    /// The MusicBrainz recording behind the track's ISRC on its proven
+    /// album, else `None`.
+    pub recording_mbid: Option<String>,
 }
 
 /// What a Spotify import step fails with.
@@ -252,15 +255,20 @@ impl SpotifyImportService {
         let info = info?;
         let tracks = tracks?;
 
-        let album_mbid = self.resolve_albums(&tracks).await;
+        let proven = self.resolve_albums(&tracks).await;
 
         let rows: Vec<ImportedTrack> = tracks
             .iter()
             .map(|track| {
                 let album = track.album.as_ref();
-                let mbid = album
+                let proof = album
                     .and_then(|album| album.id.as_deref())
-                    .and_then(|id| album_mbid.get(id).cloned());
+                    .and_then(|id| proven.get(id));
+                let mbid = proof.map(|proof| proof.release_group.clone());
+                let recording_mbid = proof.and_then(|proof| {
+                    let isrc = track.external_ids.as_ref()?.isrc.as_deref()?;
+                    proof.recording_for(isrc).map(str::to_owned)
+                });
                 let cover_url = match &mbid {
                     Some(mbid) => Some(format!("/api/v3/covers/release-group/{mbid}?size=250")),
                     None => best_image_url(album.and_then(|album| album.images.as_deref()), 250),
@@ -277,6 +285,7 @@ impl SpotifyImportService {
                     disc_number: track.disc_number,
                     duration: track.duration_ms.map(|ms| ms / 1000),
                     cover_url,
+                    recording_mbid,
                 }
             })
             .collect();
@@ -293,13 +302,13 @@ impl SpotifyImportService {
         Ok(written)
     }
 
-    /// The release group of each Spotify album on the playlist, keyed by
-    /// Spotify album id; an album nothing proves is left out. Every
-    /// ISRC the playlist has for an album counts toward its proof. A
-    /// MusicBrainz failure stops the lookups for this import: the albums
-    /// left are imported unresolved rather than waiting on a service that
-    /// is down.
-    async fn resolve_albums(&self, tracks: &[EntryTrack]) -> HashMap<String, String> {
+    /// The release group and recordings of each Spotify album on the
+    /// playlist, keyed by Spotify album id; an album nothing proves is
+    /// left out. Every ISRC the playlist has for an album counts toward its
+    /// proof. A MusicBrainz failure stops the lookups for this import: the
+    /// albums left are imported unresolved rather than waiting on a service
+    /// that is down.
+    async fn resolve_albums(&self, tracks: &[EntryTrack]) -> HashMap<String, ProvenAlbum> {
         let mut albums: Vec<(String, SpotifyAlbum)> = Vec::new();
         for track in tracks {
             let Some(album) = &track.album else { continue };
@@ -331,8 +340,8 @@ impl SpotifyImportService {
         let mut resolved = HashMap::new();
         for (index, (album_id, album)) in albums.iter().enumerate() {
             match self.resolver.resolve(album).await {
-                Ok(Some(group)) => {
-                    resolved.insert(album_id.clone(), group);
+                Ok(Some(proven)) => {
+                    resolved.insert(album_id.clone(), proven);
                 }
                 Ok(None) => {}
                 Err(error) => {

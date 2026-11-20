@@ -1,4 +1,5 @@
-//! Which MusicBrainz release group a Spotify album is.
+//! Which MusicBrainz release group a Spotify album is, and the recording
+//! behind each of its ISRCs.
 //!
 //! An album is matched only on proof, never on its name: the release
 //! search by title and artist only finds candidates, and a candidate
@@ -10,10 +11,14 @@
 //!
 //! The client has no ISRC lookup, so the proof is read from the candidate
 //! release (`inc=recordings+isrcs`), which also keeps the calls to what the
-//! album needs. Lookups run at background priority, paced by the
-//! executor, and each album's answer is kept in the metadata cache.
+//! album needs. The same read gives the recording carrying each proven
+//! ISRC, so a playlist entry can be requested as a single song. Lookups run
+//! at background priority, paced by the executor, and each album's answer
+//! is kept in the metadata cache.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 
 use droppedneedle_kernel::runtime_config::{Live, sections::MusicBrainzSettings};
 use droppedneedle_providers::cache::{CacheKey, Fetched, Policy, ProviderCacheStore, Source};
@@ -50,6 +55,25 @@ impl SpotifyAlbum {
     }
 }
 
+/// A Spotify album proven to be one MusicBrainz release group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProvenAlbum {
+    /// The release group id.
+    pub release_group: String,
+    /// The recording id behind each of the album's ISRCs found on the
+    /// proving releases, keyed by the uppercased ISRC.
+    pub recordings: BTreeMap<String, String>,
+}
+
+impl ProvenAlbum {
+    /// The recording carrying `isrc`, when the proof found it.
+    pub fn recording_for(&self, isrc: &str) -> Option<&str> {
+        self.recordings
+            .get(&isrc.trim().to_ascii_uppercase())
+            .map(String::as_str)
+    }
+}
+
 /// Finds the release group of Spotify albums through MusicBrainz.
 #[derive(Clone)]
 pub struct AlbumResolver {
@@ -69,13 +93,17 @@ impl AlbumResolver {
         }
     }
 
-    /// The album's release group id, `None` when nothing proves one.
+    /// The album's release group and recordings, `None` when nothing
+    /// proves one.
     ///
     /// # Errors
     ///
     /// A MusicBrainz failure, so the caller can stop asking while the
     /// service is down. Nothing is cached for it.
-    pub async fn resolve(&self, album: &SpotifyAlbum) -> Result<Option<String>, ProviderError> {
+    pub async fn resolve(
+        &self,
+        album: &SpotifyAlbum,
+    ) -> Result<Option<ProvenAlbum>, ProviderError> {
         if album.isrcs.is_empty() || album.title.trim().is_empty() {
             return Ok(None);
         }
@@ -94,7 +122,7 @@ impl AlbumResolver {
         let joined = isrcs.join(",");
         let key = CacheKey::hashed(
             Source::MusicBrainz,
-            "spotify_album",
+            "spotify_album_recordings",
             &[&namespace, &album.title, &album.artist, &joined],
         );
         let album = album.clone();
@@ -118,7 +146,7 @@ impl AlbumResolver {
 async fn prove(
     view: &MusicBrainzView,
     album: &SpotifyAlbum,
-) -> Result<Option<String>, ProviderError> {
+) -> Result<Option<ProvenAlbum>, ProviderError> {
     for title in title_forms(&album.title) {
         let page = view
             .search_releases(
@@ -128,13 +156,16 @@ async fn prove(
                 Criticality::IdentityCritical,
             )
             .await?;
-        let mut proven: BTreeSet<String> = BTreeSet::new();
+        let mut proven: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for hit in page.items {
             let listed = hit
                 .release_group
                 .as_ref()
                 .map(|group| normalize_mb_id(&group.id));
-            if listed.as_ref().is_some_and(|group| proven.contains(group)) {
+            if listed
+                .as_ref()
+                .is_some_and(|group| proven.contains_key(group))
+            {
                 continue;
             }
             let Some(release) = view
@@ -152,20 +183,37 @@ async fn prove(
             else {
                 continue;
             };
-            let carries = release
+            let mut recordings = BTreeMap::new();
+            for recording in release
                 .media
                 .iter()
                 .flat_map(|medium| &medium.tracks)
                 .filter_map(|track| track.recording.as_ref())
-                .flat_map(|recording| &recording.isrcs)
-                .any(|isrc| album.isrcs.contains(&isrc.trim().to_ascii_uppercase()));
-            if carries {
-                proven.insert(group);
+                .filter(|recording| is_valid_mbid(&recording.id))
+            {
+                for isrc in &recording.isrcs {
+                    let isrc = isrc.trim().to_ascii_uppercase();
+                    if album.isrcs.contains(&isrc) {
+                        recordings
+                            .entry(isrc)
+                            .or_insert_with(|| normalize_mb_id(&recording.id));
+                    }
+                }
+            }
+            if !recordings.is_empty() {
+                proven.insert(group, recordings);
             }
         }
         match proven.len() {
             0 => {}
-            1 => return Ok(proven.pop_first()),
+            1 => {
+                return Ok(proven
+                    .pop_first()
+                    .map(|(release_group, recordings)| ProvenAlbum {
+                        release_group,
+                        recordings,
+                    }));
+            }
             _ => {
                 tracing::debug!(
                     groups = proven.len(),
