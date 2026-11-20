@@ -20,7 +20,8 @@ use super::http::{batch_cancel_reply, decided_reply};
 use super::models::{
     ActionResponse, AlbumIntake, BatchCancelBody, BatchCancelResponse, BatchIntake,
     BatchIntakeResponse, ClearHistoryResponse, EditionAcquireQuery, EditionAcquireResponse,
-    EditionFetchResponse, IntakeResponse, KindQuery, RequestKind, TrackIntake, TrackIntakeResponse,
+    EditionFetchResponse, IntakeResponse, KindQuery, RequestKind, TrackBatchIntake, TrackIntake,
+    TrackIntakeResponse,
 };
 use super::service::RequestsService;
 use super::state::RequestsState;
@@ -72,6 +73,27 @@ pub async fn request_track_handler(
 ) -> Result<impl IntoResponse, ApiError> {
     let response = RequestsService::new(&state)
         .request_track(&principal, &body)
+        .await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+/// Ask for a batch of exact recordings. `POST /api/v3/requests/tracks/batches`.
+/// At most 500 rows; repeated, invalid and live rows skip, and the new rows
+/// share one quota check and approval gate. Answers 202.
+#[utoipa::path(
+    post,
+    tag = "requests",
+    path = "/api/v3/requests/tracks/batches",
+    request_body = TrackBatchIntake,
+    responses((status = 202, body = BatchIntakeResponse))
+)]
+pub async fn request_track_batch_handler(
+    State(state): State<RequestsState>,
+    User(principal): User,
+    ValidJson(body): ValidJson<TrackBatchIntake>,
+) -> Result<impl IntoResponse, ApiError> {
+    let response = RequestsService::new(&state)
+        .request_track_batch(&principal, &body)
         .await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }

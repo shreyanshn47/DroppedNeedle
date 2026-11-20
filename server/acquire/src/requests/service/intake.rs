@@ -16,7 +16,7 @@ use crate::requests::ledger::{
 };
 use crate::requests::models::{
     AlbumIntake, BatchIntake, BatchIntakeResponse, BatchIntakeStatus, IntakeResponse, RequestKind,
-    TrackIntake, TrackIntakeResponse, WaitingReason,
+    TrackBatchIntake, TrackIntake, TrackIntakeResponse, WaitingReason,
 };
 use crate::requests::quota::QuotaLedger;
 use droppedneedle_auth::Principal;
@@ -88,6 +88,50 @@ fn status_for_role(needs_approval: bool) -> RequestStatus {
     } else {
         RequestStatus::Pending
     }
+}
+
+/// The row a track ask writes for recording `mbid`, validated the same way
+/// for a single ask and a batch row.
+fn track_record(
+    principal: &Principal,
+    mbid: &str,
+    body: &TrackIntake,
+    needs_approval: bool,
+    now: u64,
+) -> Result<RequestRecord, RequestsError> {
+    if let Some(rg) = body.release_group_mbid.as_deref() {
+        validate_mbid(rg)?;
+    }
+    if let Some(artist) = body.artist_mbid.as_deref() {
+        validate_mbid(artist)?;
+    }
+    if let Some(release) = body.release_mbid.as_deref() {
+        validate_mbid(release)?;
+    }
+    let track_title = meaningful_name(Some(body.track_title.as_str())).ok_or_else(|| {
+        RequestsError::InvalidInput {
+            message: "Track title is required".to_owned(),
+        }
+    })?;
+    Ok(RequestRecord {
+        artist_name: meaningful_name(Some(body.artist_name.as_str()))
+            .unwrap_or_else(|| "Unknown".to_owned()),
+        album_title: meaningful_name(body.album_title.as_deref())
+            .unwrap_or_else(|| "Single track".to_owned()),
+        artist_mbid: body.artist_mbid.clone(),
+        release_mbid: body.release_mbid.clone(),
+        track_title: Some(track_title),
+        duration_seconds: body.duration_seconds,
+        track_release_group_mbid: body.release_group_mbid.clone(),
+        ..fresh_record(
+            RequestKind::Track,
+            mbid.to_lowercase(),
+            principal,
+            DispatchOrigin::User,
+            status_for_role(needs_approval),
+            now,
+        )
+    })
 }
 
 /// Missing-names rejection. Intake has no catalog lookup, so names are
@@ -566,25 +610,9 @@ impl RequestsService {
     ) -> Result<TrackIntakeResponse, RequestsError> {
         let role = principal.role();
         let mbid = validate_mbid(&body.recording_mbid)?;
-        if let Some(rg) = body.release_group_mbid.as_deref() {
-            validate_mbid(rg)?;
-        }
-        if let Some(artist) = body.artist_mbid.as_deref() {
-            validate_mbid(artist)?;
-        }
-        if let Some(release) = body.release_mbid.as_deref() {
-            validate_mbid(release)?;
-        }
-        let artist_name = meaningful_name(Some(body.artist_name.as_str()))
-            .unwrap_or_else(|| "Unknown".to_owned());
-        let track_title = meaningful_name(Some(body.track_title.as_str())).ok_or_else(|| {
-            RequestsError::InvalidInput {
-                message: "Track title is required".to_owned(),
-            }
-        })?;
-        let album_title = meaningful_name(body.album_title.as_deref())
-            .unwrap_or_else(|| "Single track".to_owned());
         let now = self.now_epoch();
+        let needs_approval = !auto_approves(role);
+        let record = track_record(principal, &mbid, body, needs_approval, now)?;
 
         if let Some(existing) = self.store.get(RequestKind::Track, &mbid).await?
             && (existing.status.is_active() || existing.status == RequestStatus::Cancelling)
@@ -606,24 +634,6 @@ impl RequestsService {
             .check_storage_admission(principal.user_id(), role, DispatchOrigin::User)
             .await?;
 
-        let needs_approval = !auto_approves(role);
-        let record = RequestRecord {
-            artist_name,
-            album_title,
-            artist_mbid: body.artist_mbid.clone(),
-            release_mbid: body.release_mbid.clone(),
-            track_title: Some(track_title),
-            duration_seconds: body.duration_seconds,
-            track_release_group_mbid: body.release_group_mbid.clone(),
-            ..fresh_record(
-                RequestKind::Track,
-                mbid.to_lowercase(),
-                principal,
-                DispatchOrigin::User,
-                status_for_role(needs_approval),
-                now,
-            )
-        };
         let outcome = self
             .store
             .begin(record, principal.user_id(), gate, None)
@@ -664,6 +674,141 @@ impl RequestsService {
                 })
             }
         }
+    }
+
+    /// Ask for a batch of exact recordings, such as a playlist's missing
+    /// songs. Each row is the ask [`Self::request_track`] takes: repeated
+    /// and invalid rows skip, live rows attach the caller, and the new rows
+    /// are claimed in one write under one quota gate, so a batch over quota
+    /// writes nothing. Each created row dispatches on its own.
+    pub async fn request_track_batch(
+        &self,
+        principal: &Principal,
+        body: &TrackBatchIntake,
+    ) -> Result<BatchIntakeResponse, RequestsError> {
+        let (user_id, role) = (principal.user_id(), principal.role());
+        if body.items.len() > BATCH_MAX_ITEMS {
+            return Err(RequestsError::InvalidInput {
+                message: format!("Batch must hold at most {BATCH_MAX_ITEMS} items"),
+            });
+        }
+        let now = self.now_epoch();
+        let needs_approval = !auto_approves(role);
+
+        let mut skipped = 0_u32;
+        let mut seen = std::collections::HashSet::new();
+        let mut records = Vec::new();
+        for item in &body.items {
+            let record = validate_mbid(&item.recording_mbid)
+                .and_then(|mbid| track_record(principal, &mbid, item, needs_approval, now));
+            match record {
+                Ok(record) if seen.insert(record.key.clone()) => records.push(record),
+                _ => skipped = skipped.saturating_add(1),
+            }
+        }
+
+        let live = self.store.active_mbids(RequestKind::Track).await?;
+        let (existing, new): (Vec<_>, Vec<_>) = records
+            .into_iter()
+            .partition(|record| live.contains(&record.key));
+        skipped = skipped.saturating_add(existing.len() as u32);
+        let mut attach: Vec<String> = existing.into_iter().map(|record| record.key).collect();
+
+        let mut created = Vec::new();
+        if !new.is_empty() {
+            let gate = self.quota.request_gate(
+                user_id,
+                role,
+                u32::try_from(new.len()).unwrap_or(u32::MAX),
+            )?;
+            self.quota
+                .check_storage_admission(user_id, role, DispatchOrigin::User)
+                .await?;
+            let outcomes = self
+                .store
+                .begin_batch(new, user_id, gate)
+                .await?
+                .map_err(|refusal| QuotaLedger::refusal(&refusal))?;
+            for outcome in outcomes {
+                match outcome {
+                    BeginOutcome::Won(won) => {
+                        self.announce_created(&won);
+                        created.push(won);
+                    }
+                    BeginOutcome::Existing(winner)
+                        if winner.status.is_active()
+                            || winner.status == RequestStatus::Cancelling =>
+                    {
+                        // Won by someone else between the live read and the
+                        // claim: the caller joins it.
+                        attach.push(winner.key);
+                        skipped = skipped.saturating_add(1);
+                    }
+                    BeginOutcome::Existing(_) => {
+                        skipped = skipped.saturating_add(1);
+                    }
+                }
+            }
+        }
+        for key in &attach {
+            self.store
+                .attach_requester(
+                    RequestKind::Track,
+                    key,
+                    user_id,
+                    Some(principal.username_display().to_owned()),
+                    now,
+                )
+                .await?;
+        }
+
+        if created.is_empty() {
+            let (success, message, status) = if attach.is_empty() {
+                (
+                    false,
+                    "No songs in the batch could be requested",
+                    BatchIntakeStatus::Failed,
+                )
+            } else {
+                (
+                    true,
+                    "All songs already requested",
+                    BatchIntakeStatus::AlreadyRequested,
+                )
+            };
+            return Ok(BatchIntakeResponse {
+                success,
+                message: message.to_owned(),
+                requested: 0,
+                skipped,
+                overflow: 0,
+                status,
+            });
+        }
+        if needs_approval {
+            return Ok(BatchIntakeResponse {
+                success: true,
+                message: "Songs submitted, awaiting admin approval".to_owned(),
+                requested: created.len() as u32,
+                skipped,
+                overflow: 0,
+                status: BatchIntakeStatus::AwaitingApproval,
+            });
+        }
+        // A track row always has its owner, so no actor stands in.
+        let dispatched = self.dispatch_created(&created, "").await;
+        Ok(BatchIntakeResponse {
+            success: true,
+            message: format!("Songs requested: {dispatched} started"),
+            requested: dispatched,
+            skipped,
+            overflow: 0,
+            status: if dispatched > 0 {
+                BatchIntakeStatus::Pending
+            } else {
+                BatchIntakeStatus::Failed
+            },
+        })
     }
 
     /// Ask for a batch of albums: raw dupes and

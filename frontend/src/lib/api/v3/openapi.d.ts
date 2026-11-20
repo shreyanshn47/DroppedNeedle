@@ -7670,6 +7670,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v3/requests/tracks/batches": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ask for a batch of exact recordings. `POST /api/v3/requests/tracks/batches`.
+         *     At most 500 rows; repeated, invalid and live rows skip, and the new rows
+         *     share one quota check and approval gate. Answers 202.
+         */
+        post: operations["request_track_batch_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v3/requests/tracks/{musicbrainz_id}/from-album": {
         parameters: {
             query?: never;
@@ -24095,6 +24116,14 @@ export interface components {
             classification: components["schemas"]["AlignmentClassification"];
             local_track_id: string;
             provider_position: string | null;
+        };
+        /**
+         * @description Track batch intake body (at most 500 rows), such as a playlist's
+         *     missing songs. Each row is one exact-track ask.
+         */
+        TrackBatchIntake: {
+            /** @description Songs to request. */
+            items: components["schemas"]["TrackIntake"][];
         };
         /** @description How one file fits a candidate release. */
         TrackEvidenceView: {
@@ -45573,6 +45602,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TrackIntakeResponse"];
+                };
+            };
+        };
+    };
+    request_track_batch_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TrackBatchIntake"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchIntakeResponse"];
                 };
             };
         };

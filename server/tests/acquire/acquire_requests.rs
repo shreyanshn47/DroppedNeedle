@@ -523,6 +523,81 @@ async fn an_album_dispatches_once_however_it_is_asked() {
     assert_eq!(dispatch.take_calls().await.len(), 2, "{case}");
 }
 
+/// One song of a track batch, as a playlist sends it.
+fn song(recording: &str) -> Value {
+    json!({"recording_mbid": recording, "artist_name": "Artist", "track_title": "Song"})
+}
+
+// A song batch asks each recording once: repeated and invalid rows skip, a
+// user's new rows wait for approval, a live row takes the caller as a
+// listener and the rest dispatch. The new rows share one quota check, so a
+// batch over quota writes nothing, and more than 500 rows is refused.
+#[tokio::test]
+async fn a_song_batch_asks_each_recording_once_under_one_quota() {
+    let batch = "/api/v3/requests/tracks/batches";
+    let case = "user batch";
+    let (state, _db, dispatch) = setup().await;
+    let items = json!({"items": [song(MBID_A), song(MBID_B), song(MBID_B), song("not-an-id")]});
+    let (status, body) = call(&state, Method::POST, batch, Some(ADA), Some(items)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{case}: {body}");
+    assert_eq!(body["status"], "awaiting_approval", "{case}");
+    assert_eq!(body["requested"], 2, "{case}");
+    assert_eq!(body["skipped"], 2, "{case}");
+    assert!(dispatch.take_calls().await.is_empty(), "{case}");
+
+    let case = "live rows attach";
+    let items = json!({"items": [song(MBID_A), song(MBID_C)]});
+    let (status, body) = call(&state, Method::POST, batch, Some(TRUSTED), Some(items)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{case}: {body}");
+    assert_eq!(body["status"], "pending", "{case}");
+    assert_eq!(body["requested"], 1, "{case}");
+    assert_eq!(body["skipped"], 1, "{case}");
+    assert_eq!(dispatch.take_calls().await.len(), 1, "{case}");
+    let (_, again) = call(
+        &state,
+        Method::POST,
+        batch,
+        Some(TRUSTED),
+        Some(json!({"items": [song(MBID_C)]})),
+    )
+    .await;
+    assert_eq!(again["status"], "already_requested", "{case}");
+    assert!(dispatch.take_calls().await.is_empty(), "{case}");
+
+    let case = "over quota";
+    let (state, db, dispatch) = setup().await;
+    let limited = QuotaPolicy {
+        request_count: 1,
+        ..QuotaPolicy::default()
+    };
+    let state = rebuilt(&state, &db, limited, &dispatch);
+    let items = json!({"items": [song(MBID_A), song(MBID_B)]});
+    let (status, body) = call(&state, Method::POST, batch, Some(ADA), Some(items)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{case}: {body}");
+    assert_eq!(body["error"]["code"], "QUOTA_EXCEEDED", "{case}");
+    let (_, history) = call(
+        &state,
+        Method::GET,
+        "/api/v3/requests/history",
+        Some(ADA),
+        None,
+    )
+    .await;
+    assert_eq!(history["items"], json!([]), "{case}");
+
+    let case = "too many rows";
+    let items: Vec<Value> = (0..501).map(|_| song(MBID_A)).collect();
+    let (status, _) = call(
+        &state,
+        Method::POST,
+        batch,
+        Some(ADMIN),
+        Some(json!({"items": items})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{case}");
+}
+
 const REL_1: &str = "44444444-4444-4444-8444-444444444444";
 const REL_2: &str = "55555555-5555-4555-8555-555555555555";
 const REL_3: &str = "66666666-6666-4666-8666-666666666666";

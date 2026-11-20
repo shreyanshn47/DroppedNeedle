@@ -72,6 +72,14 @@ pub struct TrackIntake {
     pub release_mbid: Option<String>,
 }
 
+/// Track batch intake body (at most 500 rows), such as a playlist's
+/// missing songs. Each row is one exact-track ask.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct TrackBatchIntake {
+    /// Songs to request.
+    pub items: Vec<TrackIntake>,
+}
+
 /// One batch row.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct BatchItem {

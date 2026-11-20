@@ -29398,6 +29398,44 @@
         ]
       }
     },
+    "/api/v3/requests/tracks/batches": {
+      "post": {
+        "tags": [
+          "requests"
+        ],
+        "summary": "Ask for a batch of exact recordings. `POST /api/v3/requests/tracks/batches`.\nAt most 500 rows; repeated, invalid and live rows skip, and the new rows\nshare one quota check and approval gate. Answers 202.",
+        "operationId": "request_track_batch_handler",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TrackBatchIntake"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BatchIntakeResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "session": [
+              "user"
+            ]
+          }
+        ]
+      }
+    },
     "/api/v3/requests/tracks/{musicbrainz_id}/from-album": {
       "post": {
         "tags": [
@@ -67646,6 +67684,22 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "TrackBatchIntake": {
+        "type": "object",
+        "description": "Track batch intake body (at most 500 rows), such as a playlist's\nmissing songs. Each row is one exact-track ask.",
+        "required": [
+          "items"
+        ],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrackIntake"
+            },
+            "description": "Songs to request."
           }
         }
       },
